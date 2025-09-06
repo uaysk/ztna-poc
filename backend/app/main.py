@@ -46,13 +46,11 @@ def reload_nginx():
 def generate_nginx_config(service: models.ServiceInDB):
     return f"""
 location {service.access_path} {{
-    # Be extra explicit to force Nginx to evaluate the variable.
-    set $my_uri $request_uri;
-    set $auth_uri "/api/check_auth?uri=$my_uri";
-    auth_request $auth_uri;
+    # Static auth_request URI using path-style endpoint
+    auth_request /api/check_auth{service.access_path};
 
-    # If auth fails (401 or 403), show a custom error.
-    error_page 401 403 = @error_response;
+    # If auth fails or backend/UEM errors occur, return 403 (not 500)
+    error_page 401 403 404 500 502 503 = @error_response;
 
     proxy_pass {service.upstream_url};
     proxy_set_header Host $host;
@@ -112,7 +110,8 @@ async def check_auth(request: Request, uri: str, db: Session = Depends(dependenc
     # 1. Get required score for the requested service
     service = crud.get_service_by_access_path(db, access_path=uri)
     if not service:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Service for path {uri} not found")
+        # Return 403 to avoid surfacing 404 as 500 via auth_request
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Service for path {uri} not found")
     
     required_score = service.required_score
 
@@ -126,6 +125,35 @@ async def check_auth(request: Request, uri: str, db: Session = Depends(dependenc
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"UEM service unavailable: {e}")
 
     # 3. Compare scores and authorize
+    if user_score >= required_score:
+        return Response(status_code=status.HTTP_200_OK)
+    else:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient security score")
+
+# Path-style variant to avoid query-string encoding issues
+@app.get("/api/check_auth/{full_path:path}")
+async def check_auth_by_path(request: Request, full_path: str, db: Session = Depends(dependencies.get_db)):
+    uri = "/" + full_path.lstrip("/")
+    username = request.cookies.get("session_id")
+    print(f"DEBUG: check_auth (by_path) received for URI: '{uri}'")
+
+    if not username:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="No session cookie")
+
+    service = crud.get_service_by_access_path(db, access_path=uri)
+    if not service:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Service for path {uri} not found")
+
+    required_score = service.required_score
+
+    try:
+        async with httpx.AsyncClient() as client:
+            res = await client.get(f"{UEM_URL}/score/{username}")
+            res.raise_for_status()
+            user_score = res.json().get("score", 0)
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"UEM service unavailable: {e}")
+
     if user_score >= required_score:
         return Response(status_code=status.HTTP_200_OK)
     else:
